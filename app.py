@@ -6,24 +6,24 @@ import os
 from datetime import datetime
 # Paste this into your Streamlit app (temporary debug)
 
-st.title("GPS Permission Debugger")
+import streamlit as st
+from streamlit_javascript import st_javascript
+import json
 
-st.write("This will check the browser permission state for geolocation, try to request a position, and return a detailed result object. Open DevTools Console to see console logs.")
+st.title("GPS Permission Debugger — fixed JSON return")
 
-if st.button("Run GPS debug"):
+if st.button("Run GPS debug (stringify result)"):
     js = r"""
     (async function(){
-      // Query the Permissions API for geolocation status (if supported)
+      // get permission state
       let permState = null;
       try {
         if (navigator.permissions && navigator.permissions.query) {
           try {
             const p = await navigator.permissions.query({ name: 'geolocation' });
-            permState = p.state; // 'granted', 'prompt', or 'denied'
-            console.log('Permissions API state:', permState);
+            permState = p.state; // 'granted' | 'prompt' | 'denied'
           } catch(e) {
             permState = 'permissions_query_failed';
-            console.warn('Permissions API query failed:', e);
           }
         } else {
           permState = 'permissions_api_unsupported';
@@ -32,15 +32,15 @@ if st.button("Run GPS debug"):
         permState = 'permissions_api_exception';
       }
 
-      // Helper to standardize error
       function wrapError(e){
         return { ok:false, code: e && e.code ? e.code : null, message: e && e.message ? e.message : String(e) };
       }
 
-      // Now attempt to getCurrentPosition
       if (!navigator.geolocation) {
-        return { ok:false, step:'no_geolocation_supported', permission: permState };
+        const out = { permission: permState, result: { ok:false, step:'no_geolocation_supported' } };
+        return JSON.stringify(out);
       }
+
       try {
         const res = await new Promise((resolve) => {
           navigator.geolocation.getCurrentPosition(
@@ -49,26 +49,36 @@ if st.button("Run GPS debug"):
             { enableHighAccuracy: true, timeout: 15000, maximumAge: 0 }
           );
         });
-        // log for devtools
-        console.log('Geolocation attempt result:', res);
-        return { permission: permState, result: res };
+        const out = { permission: permState, result: res };
+        console.log('Geolocation (to Streamlit):', out);
+        return JSON.stringify(out);
       } catch(e){
-        console.error('Unexpected exception while getting position:', e);
-        return { permission: permState, result: { ok:false, message: String(e) } };
+        const out = { permission: permState, result: { ok:false, message: String(e) } };
+        return JSON.stringify(out);
       }
     })();
     """
     try:
-        out = st_javascript(js, key="gps_debug2")
+        raw = st_javascript(js, key="gps_debug_jsonstring")
     except Exception as ex:
         st.error(f"st_javascript execution failed: {ex}")
-        out = None
+        raw = None
 
-    st.write("JS returned:")
-    st.json(out)
-    st.caption("If JS returned {permission:'denied'} or result shows code/message with 'User denied', open your browser's site settings and allow Location. If permission='prompt' but result shows no popup, try opening the app in a new tab (not embedded) and check console (F12).")
+    st.write("Raw returned value (string):")
+    st.write(raw)
 
-st.set_page_config(page_title="GPS-only Weather (Polewali fallback)", layout="centered")
+    parsed = None
+    if raw:
+        try:
+            parsed = json.loads(raw)
+        except Exception as e:
+            st.error(f"Could not parse returned JSON string: {e}")
+            parsed = raw
+
+    st.write("Parsed JSON (if any):")
+    st.json(parsed)
+    st.caption("If parsed.permission is 'denied' or parsed.result shows error code/message, follow the guidance shown earlier (allow site in browser settings, open app in a normal tab, enable precise location on Android, etc.).")
+
 
 # -------- Configuration --------
 OPENWEATHER_API_KEY = st.secrets.get("OPENWEATHER_API_KEY") or os.getenv("OPENWEATHER_API_KEY")
