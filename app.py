@@ -1,110 +1,191 @@
-# app.py -- single self-contained diagnostic (streamlit-javascript)
+# app.py
 import streamlit as st
-import json
-from time import sleep
+from streamlit_javascript import st_javascript
+import requests
+import os
+from datetime import datetime
 
-st.set_page_config(page_title="GPS diagnostic", layout="centered")
-st.title("GPS diagnostic (streamlit-javascript)")
+# ---------------------------
+# Configuration
+# ---------------------------
+st.set_page_config(page_title="GPS Weather (Polewali fallback)", layout="centered")
+st.title("GPS Weather — Allow location for best accuracy")
 
-st.markdown("""
-This page runs three tests **in order** to find where the failure is:
-1. Basic bridge sanity test (JS -> Python simple string result)  
-2. Navigator existence test (detect if browser supports geolocation)  
-3. Full geolocation call (returns JSON stringified result)
-  
-Run tests on the same device/browser where you saw the issue (Android / Windows). After clicking each button, wait a few seconds for results to appear.
-""")
+# Read API key from Streamlit secrets or environment variable
+OPENWEATHER_API_KEY = st.secrets.get("OPENWEATHER_API_KEY") or os.getenv("OPENWEATHER_API_KEY")
 
-try:
-    from streamlit_javascript import st_javascript
-except Exception as e:
-    st.error(f"Import error for streamlit_javascript: {e}")
+# Default city fallback if GPS not available / denied
+DEFAULT_CITY_QUERY = "Polewali,ID"  # change if you mean another Polewali variant
+
+# ---------------------------
+# Helper functions
+# ---------------------------
+def fetch_weather_by_coords(lat: float, lon: float, api_key: str):
+    base = "https://api.openweathermap.org/data/2.5/weather"
+    params = {"lat": lat, "lon": lon, "appid": api_key, "units": "metric"}
+    r = requests.get(base, params=params, timeout=10)
+    return r
+
+def fetch_weather_by_city(q: str, api_key: str):
+    base = "https://api.openweathermap.org/data/2.5/weather"
+    params = {"q": q, "appid": api_key, "units": "metric"}
+    r = requests.get(base, params=params, timeout=10)
+    return r
+
+def display_weather_json(resp_json, source_text):
+    name = resp_json.get("name") or DEFAULT_CITY_QUERY.split(",")[0]
+    main = resp_json.get("main", {})
+    temp = main.get("temp")
+    feels = main.get("feels_like")
+    humidity = main.get("humidity")
+    weather_desc = resp_json.get("weather", [{}])[0].get("description", "").title()
+    wind = resp_json.get("wind", {}).get("speed")
+
+    st.subheader(f"Current weather in {name}  — (source: {source_text})")
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Temp (°C)", f"{temp:.1f}" if temp is not None else "N/A",
+              delta=f"Feels {feels:.1f}°C" if feels is not None else "")
+    c2.metric("Humidity (%)", f"{humidity}" if humidity is not None else "N/A")
+    c3.metric("Wind (m/s)", f"{wind}" if wind is not None else "N/A")
+
+    st.write(f"**Condition:** {weather_desc}")
+    st.write("Raw API response:")
+    st.json(resp_json)
+    st.caption(f"Fetched at {datetime.utcfromtimestamp(resp_json.get('dt', int(datetime.utcnow().timestamp()))).isoformat()} UTC")
+
+# ---------------------------
+# Main UI
+# ---------------------------
+st.write("This app will ask you to allow browser location (GPS). If you deny or GPS fails, it will use the default location: **Polewali**.")
+
+# Show stored coords if present
+if "lat" in st.session_state and "lon" in st.session_state:
+    st.success(f"Stored GPS coordinates: {st.session_state['lat']:.6f}, {st.session_state['lon']:.6f}")
+
+col1, col2 = st.columns([1, 1])
+with col1:
+    if st.button("Get browser location (popup)"):
+        js = r"""
+        (async function(){
+          function wrapError(e){
+            return { ok:false, code: e && e.code ? e.code : null, message: e && e.message ? e.message : String(e) };
+          }
+          if (!navigator || !navigator.geolocation) {
+            return JSON.stringify({ ok:false, step: 'no_geolocation_supported' });
+          }
+          try {
+            const p = await new Promise((resolve) => {
+              navigator.geolocation.getCurrentPosition(
+                pos => resolve({ ok:true, lat: pos.coords.latitude, lon: pos.coords.longitude, acc: pos.coords.accuracy }),
+                err => resolve(wrapError(err)),
+                { enableHighAccuracy: true, timeout: 15000, maximumAge: 0 }
+              );
+            });
+            return JSON.stringify(p);
+          } catch(e) {
+            return JSON.stringify({ ok:false, step:'exception', message: String(e) });
+          }
+        })();
+        """
+        js_result = None
+        try:
+            js_result = st_javascript(js, key="get_gps")
+        except Exception as e:
+            st.warning("Could not run JS bridge. The app will use default location. (streamlit-javascript error)")
+            js_result = None
+
+        # js_result should be a JSON string (if bridge returns properly)
+        lat = lon = None
+        if isinstance(js_result, str):
+            # try parse
+            try:
+                import json
+                parsed = json.loads(js_result)
+                if parsed.get("ok"):
+                    lat = float(parsed.get("lat"))
+                    lon = float(parsed.get("lon"))
+                    st.session_state["lat"] = lat
+                    st.session_state["lon"] = lon
+                    st.success(f"Got GPS: {lat:.6f}, {lon:.6f} (accuracy ~{parsed.get('acc')} m)")
+                else:
+                    st.warning(f"Geolocation failed or denied: {parsed}")
+                    # ensure no coords are stored
+                    st.session_state.pop("lat", None)
+                    st.session_state.pop("lon", None)
+            except Exception as e:
+                st.warning(f"Could not parse JS result: {e}. Raw: {js_result}")
+                st.session_state.pop("lat", None)
+                st.session_state.pop("lon", None)
+        else:
+            # No valid return — clear coords to use default
+            st.info("No JS result from browser. Will use default city when fetching weather.")
+            st.session_state.pop("lat", None)
+            st.session_state.pop("lon", None)
+
+with col2:
+    if st.button("Clear stored location"):
+        st.session_state.pop("lat", None)
+        st.session_state.pop("lon", None)
+        st.info("Stored location cleared; app will use default city until you allow GPS.")
+
+st.markdown("---")
+
+# Manual override / for testing
+st.subheader("Manual override (for testing)")
+colA, colB = st.columns(2)
+mlat = colA.number_input("Manual lat", value=st.session_state.get("lat", 0.0), format="%.6f", key="mlat")
+mlon = colB.number_input("Manual lon", value=st.session_state.get("lon", 0.0), format="%.6f", key="mlon")
+if st.button("Use manual coordinates"):
+    st.session_state["lat"] = float(mlat)
+    st.session_state["lon"] = float(mlon)
+    st.success(f"Manual coords saved: {mlat:.6f}, {mlon:.6f}")
+
+st.markdown("---")
+
+# Fetch weather
+st.subheader("Fetch current weather")
+if not OPENWEATHER_API_KEY:
+    st.error("OpenWeatherMap API key not found. Add OPENWEATHER_API_KEY in Streamlit secrets or as environment variable.")
     st.stop()
 
-# ---- Test 1: basic JS bridge sanity ----
-st.subheader("Test 1 — Basic JS bridge sanity")
-st.write("This test runs a minimal JS expression that returns a JSON string. Expected: parsed JSON object {'hello':'world'}")
-if st.button("Run Test 1 (bridge)"):
-    try:
-        raw = st_javascript("JSON.stringify({hello:'world'})", key="t1")
-    except Exception as ex:
-        st.error(f"st_javascript raised exception: {ex}")
-        raw = None
-    st.write("raw returned value (should be a JSON string):")
-    st.write(raw)
-    parsed = None
-    if raw:
+if st.button("Get current weather"):
+    # priority: GPS in session_state -> default city
+    if "lat" in st.session_state and "lon" in st.session_state:
+        lat = st.session_state["lat"]
+        lon = st.session_state["lon"]
         try:
-            parsed = json.loads(raw)
-            st.success("Parsed JSON (OK):")
-            st.json(parsed)
+            r = fetch_weather_by_coords(lat, lon, OPENWEATHER_API_KEY)
         except Exception as e:
-            st.error(f"Could not parse raw as JSON: {e}")
-            st.write("raw (repr):", repr(raw))
+            st.error(f"Error contacting weather API: {e}")
+            r = None
+
+        if r is None:
+            st.error("No response from weather API.")
+        else:
+            if not r.ok:
+                try:
+                    st.error(f"Weather API error (coords): {r.status_code} - {r.json()}")
+                except Exception:
+                    st.error(f"Weather API error (coords): {r.status_code} - {r.text}")
+            else:
+                display_weather_json(r.json(), source_text="GPS coordinates")
     else:
-        st.warning("No raw value returned (None/empty/0)")
+        try:
+            r = fetch_weather_by_city(DEFAULT_CITY_QUERY, OPENWEATHER_API_KEY)
+        except Exception as e:
+            st.error(f"Error contacting weather API: {e}")
+            r = None
+
+        if r is None:
+            st.error("No response from weather API.")
+        else:
+            if not r.ok:
+                try:
+                    st.error(f"Weather API error (default city): {r.status_code} - {r.json()}")
+                except Exception:
+                    st.error(f"Weather API error (default city): {r.status_code} - {r.text}")
+            else:
+                display_weather_json(r.json(), source_text=f"default city: {DEFAULT_CITY_QUERY.split(',')[0]}")
 
 st.markdown("---")
-
-# ---- Test 2: navigator.geolocation existence ----
-st.subheader("Test 2 — navigator.geolocation availability")
-st.write("This checks whether the browser environment even exposes navigator.geolocation.")
-if st.button("Run Test 2 (navigator)"):
-    js = "JSON.stringify({ navigator_geolocation: !!(navigator && navigator.geolocation) })"
-    try:
-        raw2 = st_javascript(js, key="t2")
-    except Exception as ex:
-        st.error(f"st_javascript raised exception: {ex}")
-        raw2 = None
-    st.write("raw returned value:")
-    st.write(raw2)
-    if raw2:
-        try:
-            st.json(json.loads(raw2))
-        except Exception as e:
-            st.error(f"Could not parse: {e}")
-            st.write("raw repr:", repr(raw2))
-
-st.markdown("---")
-
-# ---- Test 3: full geolocation (stringified) ----
-st.subheader("Test 3 — full geolocation attempt (stringified)")
-st.write("This will request permission in the browser. The browser should show the Allow/Block popup. If no popup appears, open the app in a normal tab (not embedded).")
-if st.button("Run Test 3 (geolocation)"):
-    js = r"""
-    (async function(){
-      function wrapError(e){
-        return {ok:false, code: e && e.code ? e.code : null, message: e && e.message ? e.message : String(e)};
-      }
-      if (!navigator || !navigator.geolocation) {
-        return JSON.stringify({ok:false, step:'no_geolocation_supported'});
-      }
-      try {
-        const p = await new Promise((resolve) => {
-          navigator.geolocation.getCurrentPosition(
-            pos => resolve({ok:true, lat: pos.coords.latitude, lon: pos.coords.longitude, acc: pos.coords.accuracy}),
-            err => resolve(wrapError(err)),
-            {enableHighAccuracy:true, timeout:15000, maximumAge:0}
-          );
-        });
-        return JSON.stringify({ok:true, result:p});
-      } catch(e){
-        return JSON.stringify({ok:false, step:'exception', message:String(e)});
-      }
-    })();
-    """
-    try:
-        raw3 = st_javascript(js, key="t3")
-    except Exception as ex:
-        st.error(f"st_javascript raised exception: {ex}")
-        raw3 = None
-
-    st.write("raw returned value (string):")
-    st.write(raw3)
-    if raw3:
-        try:
-            st.write("parsed JSON:")
-            st.json(json.loads(raw3))
-        except Exception as e:
-            st.error(f"Could not parse returned string as JSON: {e}")
-            st.write("raw repr:", repr(raw3))
+st.caption("Privacy: This app uses browser GPS only when you allow it. If you deny, it uses the default city Polewali. No IP lookup is performed.")
