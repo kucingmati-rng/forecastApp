@@ -67,7 +67,7 @@ if st.button("Run GPS debug"):
     st.write("JS returned:")
     st.json(out)
     st.caption("If JS returned {permission:'denied'} or result shows code/message with 'User denied', open your browser's site settings and allow Location. If permission='prompt' but result shows no popup, try opening the app in a new tab (not embedded) and check console (F12).")
-// debug
+
 st.set_page_config(page_title="GPS-only Weather (Polewali fallback)", layout="centered")
 
 # -------- Configuration --------
