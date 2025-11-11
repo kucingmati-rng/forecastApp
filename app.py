@@ -1,37 +1,30 @@
 # app.py
 # Path: app.py
 """
-Streamlit Forecast App
+Streamlit Forecast App — FREE APIs (Open-Meteo + Nominatim + ipapi.co)
 Features:
-- Browser GPS (via embedded JS + redirect to set query params)
-- IP-based geolocation fallback (ipapi.co)
-- City search (OpenWeather geocoding)
-- Fetches weather from OpenWeather One Call API (uses st.secrets["OPENWEATHER_API_KEY"])
+- Browser GPS (best accuracy), IP-based fallback, City search (Nominatim)
+- No OpenWeather key required (uses Open-Meteo)
+- Shows current + hourly (12h) + 7-day forecast, simple charts
 """
+
+from typing import Optional, Tuple, Dict, Any
+from datetime import datetime, timezone
+import urllib.parse
 
 import streamlit as st
 import streamlit.components.v1 as components
 import requests
 import pandas as pd
 import matplotlib.pyplot as plt
-from datetime import datetime
-from typing import Optional, Tuple
 
-# ------------------------
-# Minimal configuration
-# ------------------------
-st.set_page_config(page_title="Forecast App", layout="centered")
-OPENWEATHER_KEY = st.secrets.get("OPENWEATHER_API_KEY")
-if not OPENWEATHER_KEY:
-    st.error("OpenWeather API key not found in st.secrets['OPENWEATHER_API_KEY']. Add it and reload.")
-    st.stop()
+# ---------- CONFIG ----------
+st.set_page_config(page_title="Free Forecast App", layout="centered")
+DEFAULT_UNITS = "metric"  # Open-Meteo returns Celsius by default
 
-# ------------------------
-# Utility functions
-# ------------------------
+# ---------- UTIL (cache network calls) ----------
 @st.cache_data(ttl=300)
 def ip_geolocation() -> Optional[dict]:
-    """Get approximate location from IP (fallback)."""
     try:
         r = requests.get("https://ipapi.co/json/", timeout=6)
         if r.ok:
@@ -40,33 +33,33 @@ def ip_geolocation() -> Optional[dict]:
         return None
     return None
 
-@st.cache_data(ttl=300)
-def geocode_city(city: str) -> Optional[dict]:
-    """Use OpenWeather Geocoding API to convert city to lat/lon. Returns first match."""
+@st.cache_data(ttl=86400)
+def geocode_city_nominatim(city: str) -> Optional[dict]:
+    url = "https://nominatim.openstreetmap.org/search"
+    params = {"q": city, "format": "json", "limit": 1}
+    headers = {"User-Agent": "FreeForecastApp/1.0 (+https://example.com)"}
     try:
-        url = "http://api.openweathermap.org/geo/1.0/direct"
-        params = {"q": city, "limit": 1, "appid": OPENWEATHER_KEY}
-        r = requests.get(url, params=params, timeout=8)
+        r = requests.get(url, params=params, headers=headers, timeout=8)
         r.raise_for_status()
         data = r.json()
         if data:
-            return data[0]  # dict with name, lat, lon, country, etc.
+            return data[0]
     except Exception:
         return None
     return None
 
 @st.cache_data(ttl=300)
-def fetch_weather(lat: float, lon: float, units: str = "metric") -> Optional[dict]:
-    """Fetch current + hourly + daily weather from OpenWeather One Call API."""
+def open_meteo_forecast(lat: float, lon: float, timezone_str: str = "auto") -> Optional[dict]:
+    url = "https://api.open-meteo.com/v1/forecast"
+    params = {
+        "latitude": lat,
+        "longitude": lon,
+        "hourly": "temperature_2m,relativehumidity_2m,precipitation,weathercode",
+        "daily": "temperature_2m_max,temperature_2m_min,precipitation_sum,weathercode",
+        "forecast_days": 8,  # today + 7 days
+        "timezone": timezone_str,
+    }
     try:
-        url = "https://api.openweathermap.org/data/2.5/onecall"
-        params = {
-            "lat": lat,
-            "lon": lon,
-            "units": units,
-            "exclude": "minutely,alerts",
-            "appid": OPENWEATHER_KEY,
-        }
         r = requests.get(url, params=params, timeout=10)
         r.raise_for_status()
         return r.json()
@@ -74,242 +67,258 @@ def fetch_weather(lat: float, lon: float, units: str = "metric") -> Optional[dic
         return None
 
 def coords_from_query() -> Optional[Tuple[float, float]]:
-    """Return lat/lon if present in query params."""
     qp = st.experimental_get_query_params()
     if "lat" in qp and "lon" in qp:
         try:
-            lat = float(qp["lat"][0])
-            lon = float(qp["lon"][0])
-            return lat, lon
+            return float(qp["lat"][0]), float(qp["lon"][0])
         except Exception:
             return None
     return None
 
-def clear_location_query():
-    st.experimental_set_query_params()  # clear all query params
+def clear_query_params():
+    st.experimental_set_query_params()
 
-def js_geolocation_redirect_button(button_label="Get my location (browser GPS)"):
-    """Embed JS to get browser geolocation and redirect with lat/lon query params."""
+def js_geolocation_redirect_button(label: str = "Get my location (browser GPS)"):
     html = f"""
     <div>
-      <button id="getloc">{button_label}</button>
-      <p id="msg"></p>
+      <button id="getloc">{label}</button>
+      <p id="msg" style="font-size:0.9rem;color:#666;margin-top:8px"></p>
     </div>
     <script>
     const btn = document.getElementById("getloc");
     const msg = document.getElementById("msg");
     btn.onclick = () => {{
       if (!navigator.geolocation) {{
-        msg.innerText = "Geolocation not supported.";
+        msg.innerText = "Geolocation not supported by your browser.";
         return;
       }}
-      msg.innerText = "Requesting location...";
+      msg.innerText = "Requesting location… (browser may ask for permission)";
       navigator.geolocation.getCurrentPosition(
         (pos) => {{
           const lat = pos.coords.latitude;
           const lon = pos.coords.longitude;
-          // Redirect back to the Streamlit app with coordinates in query params
-          const search = window.location.search;
-          const base = window.location.pathname + window.location.hash;
-          const newUrl = base + "?lat=" + lat + "&lon=" + lon + "&source=gps";
-          // Use replace to avoid creating history entries for privacy
+          const newUrl = window.location.pathname + "?lat=" + lat + "&lon=" + lon + "&source=gps";
           window.location.replace(newUrl);
         }},
         (err) => {{
           msg.innerText = "Error obtaining location: " + err.message;
         }},
-        {{ enableHighAccuracy: true, timeout: 10000, maximumAge: 60000 }}
+        {{enableHighAccuracy:true, timeout:10000, maximumAge:60000}}
       );
     }};
     </script>
     """
     components.html(html, height=120)
 
-# ------------------------
-# UI - Sidebar
-# ------------------------
-st.title("📡 Forecast App")
+# ---------- UI: Sidebar ----------
+st.title("🌤️ Free Forecast App")
+st.sidebar.header("Location & settings")
 
-st.sidebar.header("Location selection")
-loc_method = st.sidebar.radio("Choose location source:", ("Browser GPS (best)", "IP-based (fallback)", "Search city"))
-
-units = st.sidebar.selectbox("Units", ("metric", "imperial"))
-refresh = st.sidebar.button("Clear location & refresh")
-
-if refresh:
-    clear_location_query()
+loc_choice = st.sidebar.radio("Choose location source:", ("Browser GPS (best)", "IP-based (fallback)", "Search city"))
+units = st.sidebar.selectbox("Units", ("metric",))  # Open-Meteo returns Celsius — keep simple
+if st.sidebar.button("Clear saved location / params"):
+    clear_query_params()
     st.experimental_rerun()
 
-# Determine lat/lon and display name
+# ---------- Determine coordinates ----------
 lat_lon = coords_from_query()
+lat = lon = None
 location_name = None
 location_source = None
 
-if loc_method == "Browser GPS (best)":
-    # If lat/lon already in query params, use that, else show button to obtain
+if loc_choice == "Browser GPS (best)":
     if lat_lon:
         lat, lon = lat_lon
-        location_source = "GPS (browser)"
+        location_source = "Browser GPS"
     else:
-        st.sidebar.markdown("Use your browser's geolocation API for best accuracy.")
+        st.sidebar.write("Click the button to let your browser share location (high accuracy).")
         js_geolocation_redirect_button()
-        st.sidebar.write("Or switch to IP-based or Search city if browser permission denied.")
-        lat = lon = None
+        st.sidebar.write("If permission denied, use IP-based or city search.")
+        st.stop()
 
-elif loc_method == "IP-based (fallback)":
-    ip_data = ip_geolocation()
-    if ip_data and "latitude" in ip_data and "longitude" in ip_data:
-        lat = float(ip_data["latitude"])
-        lon = float(ip_data["longitude"])
-    elif ip_data and "lat" in ip_data and "lon" in ip_data:
-        lat = float(ip_data["lat"])
-        lon = float(ip_data["lon"])
+elif loc_choice == "IP-based (fallback)":
+    ipdata = ip_geolocation()
+    if not ipdata:
+        st.sidebar.error("IP geolocation failed.")
     else:
-        # Many IP APIs return lat/lon as floats in keys "latitude"/"longitude" or "lat"/"lon"
-        lat = lon = None
-    if ip_data:
-        city = ip_data.get("city") or ip_data.get("region") or ip_data.get("country_name")
-        location_name = city
-    location_source = "IP-based"
+        # ipapi gives latitude/longitude keys
+        lat = float(ipdata.get("latitude") or ipdata.get("lat") or 0)
+        lon = float(ipdata.get("longitude") or ipdata.get("lon") or 0)
+        location_name = ipdata.get("city") or ipdata.get("region") or ipdata.get("country_name")
+        location_source = "IP-based"
 
-elif loc_method == "Search city":
-    city_query = st.sidebar.text_input("City name (e.g. Jakarta,ID or Bandung)", "")
-    if st.sidebar.button("Find city"):
-        if city_query.strip():
-            ge = geocode_city(city_query.strip())
-            if ge:
-                lat = ge["lat"]
-                lon = ge["lon"]
-                location_name = f"{ge.get('name','')}, {ge.get('country','')}"
-                # set query params so GPS button / urls reflect coords and user can bookmark
-                st.experimental_set_query_params(lat=lat, lon=lon, source="city", city=ge.get("name",""))
-                st.experimental_rerun()
-            else:
-                st.sidebar.error("City not found via OpenWeather geocoding.")
-                lat = lon = None
-        else:
-            st.sidebar.warning("Enter a city name first.")
-            lat = lon = None
+elif loc_choice == "Search city":
+    city_query = st.sidebar.text_input("City name (e.g. Jakarta, Indonesia)", "")
+    if st.sidebar.button("Find"):
+        if not city_query.strip():
+            st.sidebar.warning("Type a city name first.")
+            st.stop()
+        geo = geocode_city_nominatim(city_query.strip())
+        if not geo:
+            st.sidebar.error("City not found (Nominatim). Try a different query.")
+            st.stop()
+        lat = float(geo["lat"])
+        lon = float(geo["lon"])
+        display_name = geo.get("display_name", "")
+        location_name = display_name
+        location_source = "City search"
+        # set query params so user can bookmark location
+        st.experimental_set_query_params(lat=lat, lon=lon, source="city", city=urllib.parse.quote_plus(city_query.strip()))
+        st.experimental_rerun()
     else:
-        # If user arrived via query params (e.g., redirected from GPS) respect that
+        # allow bookmark / url with lat/lon to populate
         if lat_lon:
             lat, lon = lat_lon
             location_source = "From query"
         else:
-            lat = lon = None
+            st.sidebar.info("Enter a city and click Find, or use GPS/IP.")
+            st.stop()
 
-# If lat/lon still None but query params present earlier, handle them
-if not (lat is not None and lon is not None):
+if lat is None or lon is None:
     qp_coords = coords_from_query()
     if qp_coords:
         lat, lon = qp_coords
         location_source = "Query param"
 
-# If we have lat/lon, optionally reverse lookup city name using OpenWeather reverse geocoding
-if lat is not None and lon is not None:
-    # Try reverse geocoding to get a readable city name (best-effort)
-    try:
-        rg_url = "http://api.openweathermap.org/geo/1.0/reverse"
-        rg_params = {"lat": lat, "lon": lon, "limit": 1, "appid": OPENWEATHER_KEY}
-        rg = requests.get(rg_url, params=rg_params, timeout=6)
-        if rg.ok:
-            rgj = rg.json()
-            if isinstance(rgj, list) and rgj:
-                loc = rgj[0]
-                name_part = loc.get("name") or ""
-                country = loc.get("country") or ""
-                if name_part:
-                    location_name = f"{name_part}, {country}" if country else name_part
-    except Exception:
-        pass
-
-# ------------------------
-# Main content: fetch & show weather
-# ------------------------
 if lat is None or lon is None:
-    st.info("No coordinates available yet. Choose a method and provide location.")
+    st.info("No location provided yet. Choose Browser GPS, IP-based, or Search city.")
     st.stop()
 
-with st.spinner("Fetching weather..."):
-    weather = fetch_weather(lat=lat, lon=lon, units=units)
-if not weather:
-    st.error("Failed to fetch weather from OpenWeather. Check API key and network.")
+# ---------- Fetch forecast ----------
+with st.spinner("Fetching forecast (free) ..."):
+    forecast = open_meteo_forecast(lat=lat, lon=lon, timezone_str="auto")
+
+if not forecast:
+    st.error("Failed to fetch forecast from Open-Meteo. Check network.")
     st.stop()
 
-# Header with location & source
+# ---------- Parse and display ----------
+# Show header
+display_loc = location_name or f"Lat {lat:.4f}, Lon {lon:.4f}"
 col1, col2 = st.columns([3, 1])
 with col1:
-    st.subheader(location_name or f"Lat {lat:.4f}, Lon {lon:.4f}")
+    st.subheader(display_loc)
     if location_source:
         st.caption(f"Location source: {location_source}")
 with col2:
-    if st.button("Use this location as default (set query params)"):
-        st.experimental_set_query_params(lat=lat, lon=lon, source=location_source or "user")
+    if st.button("Set as default (add to URL)"):
+        st.experimental_set_query_params(lat=lat, lon=lon, source=location_source or "manual")
         st.experimental_rerun()
 
-# Current weather
-current = weather.get("current", {})
-curr_dt = datetime.utcfromtimestamp(current.get("dt", 0)).strftime("%Y-%m-%d %H:%M UTC")
-temp = current.get("temp")
-feels = current.get("feels_like")
-desc = current.get("weather", [{}])[0].get("description", "").title()
-humidity = current.get("humidity")
-wind = current.get("wind_speed")
-pressure = current.get("pressure")
+# Helper: weather code → text (basic)
+WEATHER_CODE_MAP = {
+    0: "Clear sky",
+    1: "Mainly clear",
+    2: "Partly cloudy",
+    3: "Overcast",
+    45: "Fog",
+    48: "Depositing rime fog",
+    51: "Drizzle: Light",
+    53: "Drizzle: Moderate",
+    55: "Drizzle: Dense",
+    61: "Rain: Slight",
+    63: "Rain: Moderate",
+    65: "Rain: Heavy",
+    71: "Snow: Slight",
+    73: "Snow: Moderate",
+    75: "Snow: Heavy",
+    80: "Rain showers: Slight",
+    81: "Rain showers: Moderate",
+    82: "Rain showers: Violent",
+    95: "Thunderstorm",
+    96: "Thunderstorm with slight hail",
+    99: "Thunderstorm with heavy hail",
+}
+
+def wc_text(code: int) -> str:
+    return WEATHER_CODE_MAP.get(int(code), f"Code {code}")
+
+# Current (nearest hour)
+try:
+    tz = forecast.get("timezone", "UTC")
+    hourly = forecast.get("hourly", {})
+    hourly_times = hourly.get("time", [])
+    temps = hourly.get("temperature_2m", [])
+    rh = hourly.get("relativehumidity_2m", [])
+    precip = hourly.get("precipitation", [])
+    wcodes = hourly.get("weathercode", [])
+    # find nearest hour index
+    now_local = datetime.now(timezone.utc).astimezone()  # local tz object
+    now_iso = now_local.replace(minute=0, second=0, microsecond=0).isoformat()
+    # Find index by matching date/time prefix (safe fallback to first)
+    idx = 0
+    for i, t in enumerate(hourly_times):
+        if t.startswith(now_local.strftime("%Y-%m-%dT%H")):
+            idx = i
+            break
+    curr_temp = temps[idx] if idx < len(temps) else None
+    curr_rh = rh[idx] if idx < len(rh) else None
+    curr_prec = precip[idx] if idx < len(precip) else None
+    curr_code = wcodes[idx] if idx < len(wcodes) else None
+except Exception:
+    curr_temp = curr_rh = curr_prec = curr_code = None
 
 st.markdown("### Now")
-st.write(f"**{desc}** — {temp}°{'C' if units=='metric' else 'F'} (feels like {feels}°)")
-st.write(f"Humidity: {humidity}% · Wind: {wind} {'m/s' if units=='metric' else 'mph'} · Pressure: {pressure} hPa")
-st.write(f"Observed: {curr_dt}")
+if curr_temp is not None:
+    st.write(f"**{wc_text(curr_code)}** — {curr_temp}°C")
+    st.write(f"Humidity: {curr_rh}% · Precip (hour): {curr_prec} mm")
+else:
+    st.write("Current conditions unavailable.")
 
-# Hourly (compact)
-hourly = weather.get("hourly", [])[:12]  # next 12 hours
-if hourly:
-    hours = []
-    temps = []
-    for h in hourly:
-        hours.append(datetime.utcfromtimestamp(h["dt"]).strftime("%H:%M"))
-        temps.append(h["temp"])
-    fig, ax = plt.subplots(figsize=(6, 2.5))
-    ax.plot(hours, temps, marker="o")
-    ax.set_title("Next 12 hours temperature")
-    ax.set_xlabel("")
-    ax.set_ylabel(f"Temp ({'°C' if units=='metric' else '°F'})")
-    ax.tick_params(axis='x', rotation=45)
+# Hourly mini-plot (next 12 hours)
+st.markdown("### Next 12 hours")
+try:
+    hours_count = min(12, len(hourly_times))
+    next_times = hourly_times[:hours_count]
+    next_temps = temps[:hours_count]
+    df_h = pd.DataFrame({"time": next_times, "temp": next_temps})
+    df_h["time_readable"] = pd.to_datetime(df_h["time"]).dt.strftime("%m-%d %H:%M")
+    fig, ax = plt.subplots(figsize=(7, 2.4))
+    ax.plot(df_h["time_readable"], df_h["temp"], marker="o")
+    ax.set_ylabel("°C")
+    ax.set_xticklabels(df_h["time_readable"], rotation=45, ha="right")
+    ax.set_title("Hourly temperature (next 12h)")
     st.pyplot(fig)
+except Exception:
+    st.write("Hourly plot unavailable.")
 
-# Daily forecast table & plot
-daily = weather.get("daily", [])[:8]  # today + 7 days
-if daily:
+# Daily table + plot (today + 7 days)
+st.markdown("### 7-day forecast")
+try:
+    daily = forecast.get("daily", {})
+    d_times = daily.get("time", [])
+    d_min = daily.get("temperature_2m_min", [])
+    d_max = daily.get("temperature_2m_max", [])
+    d_prec = daily.get("precipitation_sum", [])
+    d_wcodes = daily.get("weathercode", [])
+
     rows = []
-    for d in daily:
-        dt = datetime.utcfromtimestamp(d["dt"]).strftime("%a %Y-%m-%d")
-        temp_min = d["temp"]["min"]
-        temp_max = d["temp"]["max"]
-        weather_desc = d.get("weather", [{}])[0].get("description","").title()
-        pop = int(d.get("pop", 0) * 100)  # probability of precipitation
-        rows.append({"date": dt, "min": temp_min, "max": temp_max, "desc": weather_desc, "pop%": pop})
-    df = pd.DataFrame(rows)
-    st.markdown("### 7-day forecast")
-    st.dataframe(df.set_index("date"))
+    for i, dt in enumerate(d_times):
+        rows.append({
+            "date": dt,
+            "min": d_min[i] if i < len(d_min) else None,
+            "max": d_max[i] if i < len(d_max) else None,
+            "precip_mm": d_prec[i] if i < len(d_prec) else None,
+            "desc": wc_text(d_wcodes[i]) if i < len(d_wcodes) else "",
+        })
+    df_d = pd.DataFrame(rows).set_index("date")
+    st.dataframe(df_d)
 
-    # plot daily min/max
     fig2, ax2 = plt.subplots(figsize=(7, 3))
-    ax2.plot(df.index, df["min"], marker="o", label="Min")
-    ax2.plot(df.index, df["max"], marker="o", label="Max")
-    ax2.set_title("7-day min / max temps")
-    ax2.set_ylabel(f"Temp ({'°C' if units=='metric' else '°F'})")
-    ax2.tick_params(axis='x', rotation=45)
+    ax2.plot(df_d.index, df_d["min"], marker="o", label="Min")
+    ax2.plot(df_d.index, df_d["max"], marker="o", label="Max")
+    ax2.set_ylabel("°C")
+    ax2.set_xticklabels(df_d.index, rotation=45, ha="right")
     ax2.legend()
+    ax2.set_title("Daily min / max")
     st.pyplot(fig2)
+except Exception:
+    st.write("Daily forecast unavailable.")
 
-# Optional: small metadata and raw data toggle
-with st.expander("Raw API response (debug)"):
-    st.json(weather)
+# Raw data debug
+with st.expander("Raw forecast JSON"):
+    st.json(forecast)
 
-st.success("Weather data loaded ✅")
-
-# Footer: tips
+st.success("Forecast loaded (Open-Meteo, free) ✅")
 st.markdown("---")
-st.caption("Tips: If browser GPS doesn't return location, ensure your browser allows location access. IP geolocation is approximate (city-level). City search uses OpenWeather geocoding.")
-
+st.caption("APIs used: Open-Meteo (forecast), Nominatim (city geocoding), ipapi.co (IP location). No API keys required.")
